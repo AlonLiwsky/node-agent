@@ -38,12 +38,17 @@ func CalculateFileHashes(path string) (sha1Hash string, md5Hash string, err erro
 		_ = file.Close()
 	}(file)
 
+	return CalculateHashes(file)
+}
+
+// CalculateHashes calculates both SHA1 and MD5 hashes of everything r yields.
+func CalculateHashes(r io.Reader) (sha1Hash string, md5Hash string, err error) {
 	sha1Hash256 := sha1.New()
 	md5Hash256 := md5.New()
 
 	multiWriter := io.MultiWriter(sha1Hash256, md5Hash256)
 
-	if _, err := io.Copy(multiWriter, file); err != nil {
+	if _, err := io.Copy(multiWriter, r); err != nil {
 		return "", "", err
 	}
 

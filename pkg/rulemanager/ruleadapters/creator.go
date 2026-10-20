@@ -3,6 +3,7 @@ package ruleadapters
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,19 +23,38 @@ import (
 	"github.com/kubescape/node-agent/pkg/rulemanager/types"
 	typesv1 "github.com/kubescape/node-agent/pkg/rulemanager/types/v1"
 	"github.com/kubescape/node-agent/pkg/utils"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
 	maxFileSize      = 50 * 1024 * 1024 // 50MB
-	hashCacheTTL     = 1 * time.Minute
+	hashCacheTTL     = 30 * time.Minute
 	hashCacheMaxSize = 50000
+
+	// racyWindow is how recent a file's ctime may be, relative to the moment it is
+	// hashed, before the hash is not cached. The kernel stamps mtime and ctime
+	// from a coarse clock, so a rewrite of the same size within the same tick as
+	// the previous change leaves the identity unchanged. Such a file is hashed
+	// again on the next alert instead.
+	racyWindow = 2500 * time.Millisecond
 )
 
 var ErrRuleShouldNotBeAlerted = errors.New("rule should not be alerted")
 
+var errFileChanged = errors.New("file changed while it was being hashed")
+
 type FileHashCache struct {
 	SHA1Hash string
 	MD5Hash  string
+}
+
+// hashKey identifies one file in one container. Each overlay mount has its own
+// st_dev, so the identity already tells containers apart; the container ID is
+// defence in depth, because anonymous device numbers are reused after a
+// container exits.
+type hashKey struct {
+	containerID string
+	file        utils.FileIdentity
 }
 
 type RuleFailureCreator struct {
@@ -42,19 +62,24 @@ type RuleFailureCreator struct {
 	containerIdToPid *maps.SafeMap[string, uint32]
 	dnsManager       dnsmanager.DNSResolver
 	enricher         types.Enricher
-	hashCache        *expirable.LRU[string, *FileHashCache]
+	hashCache        *expirable.LRU[hashKey, *FileHashCache]
+	hashGroup        singleflight.Group
+	racyWindow       time.Duration
+	calculateHashes  func(io.Reader) (sha1Hash, md5Hash string, err error)
 	alertPlatform    armotypes.AlertSourcePlatform
 	agentVersion     string
 }
 
 func NewRuleFailureCreator(enricher types.Enricher, dnsManager dnsmanager.DNSResolver, adapterFactory *EventRuleAdapterFactory, alertPlatform armotypes.AlertSourcePlatform, agentVersion string, containerIdToPid *maps.SafeMap[string, uint32]) *RuleFailureCreator {
-	hashCache := expirable.NewLRU[string, *FileHashCache](hashCacheMaxSize, nil, hashCacheTTL)
+	hashCache := expirable.NewLRU[hashKey, *FileHashCache](hashCacheMaxSize, nil, hashCacheTTL)
 	return &RuleFailureCreator{
 		adapterFactory:   adapterFactory,
 		containerIdToPid: containerIdToPid,
 		dnsManager:       dnsManager,
 		enricher:         enricher,
 		hashCache:        hashCache,
+		calculateHashes:  utils.CalculateHashes,
+		racyWindow:       racyWindow,
 		alertPlatform:    alertPlatform,
 		agentVersion:     agentVersion,
 	}
@@ -231,12 +256,11 @@ func (r *RuleFailureCreator) setBaseRuntimeAlert(ruleFailure *types.GenericRuleF
 	if triggerEvent != nil {
 		baseRuntimeAlert.Timestamp = time.Unix(0, int64(triggerEvent.GetTimestamp()))
 	}
-	var size int64 = 0
+	var size int64
+	var regular bool
 	if hostPath != "" {
-		var err error
-		size, err = utils.GetFileSize(hostPath)
-		if err != nil {
-			size = 0
+		if identity, isRegular, err := utils.StatFile(hostPath); err == nil {
+			size, regular = identity.Size, isRegular
 		}
 	}
 
@@ -244,27 +268,70 @@ func (r *RuleFailureCreator) setBaseRuntimeAlert(ruleFailure *types.GenericRuleF
 		baseRuntimeAlert.Size = humanize.Bytes(uint64(size))
 	}
 
-	if size != 0 && size < maxFileSize { //&& hostPath != "" {
+	// Only a regular file is opened: opening a FIFO would block this goroutine.
+	if regular && size != 0 && size < maxFileSize {
 		if baseRuntimeAlert.MD5Hash == "" || baseRuntimeAlert.SHA1Hash == "" {
-			if cached, found := r.hashCache.Get(hostPath); found {
-				baseRuntimeAlert.MD5Hash = cached.MD5Hash
-				baseRuntimeAlert.SHA1Hash = cached.SHA1Hash
-			} else {
-				sha1hash, md5hash, err := utils.CalculateFileHashes(hostPath)
-				if err == nil {
-					baseRuntimeAlert.MD5Hash = md5hash
-					baseRuntimeAlert.SHA1Hash = sha1hash
-					r.hashCache.Add(hostPath, &FileHashCache{
-						SHA1Hash: sha1hash,
-						MD5Hash:  md5hash,
-					})
-				}
+			containerID := ""
+			if triggerEvent != nil {
+				containerID = triggerEvent.GetContainerID()
+			}
+			if hashes := r.fileHashes(hostPath, containerID); hashes != nil {
+				baseRuntimeAlert.MD5Hash = hashes.MD5Hash
+				baseRuntimeAlert.SHA1Hash = hashes.SHA1Hash
 			}
 		}
 	}
 
 	ruleFailure.SetBaseRuntimeAlert(baseRuntimeAlert)
 
+}
+
+// fileHashes returns the hashes of the file at path, or nil when it cannot be
+// hashed. The file is opened once and its identity, size and content all come
+// from that descriptor. Hashes are cached per container and file identity, and
+// concurrent requests for one entry share one computation. A hash is not cached
+// for a file on tmpfs, for a file changed within racyWindow of now, or for a file
+// that changed while it was being hashed.
+func (r *RuleFailureCreator) fileHashes(path, containerID string) *FileHashCache {
+	start := time.Now()
+	file, identity, err := utils.OpenRegularFile(path)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = file.Close() }()
+	if identity.Size == 0 || identity.Size >= maxFileSize {
+		return nil
+	}
+
+	key := hashKey{containerID: containerID, file: identity}
+	if cached, found := r.hashCache.Get(key); found {
+		return cached
+	}
+	cacheable := utils.IsCacheableFS(file) && start.UnixNano()-identity.CtimeNs >= r.racyWindow.Nanoseconds()
+
+	v, err, _ := r.hashGroup.Do(fmt.Sprintf("%+v", key), func() (any, error) {
+		if cached, found := r.hashCache.Get(key); found {
+			return cached, nil
+		}
+		// Read exactly the bytes the identity describes, then check that the
+		// file is still the same one.
+		sha1hash, md5hash, err := r.calculateHashes(io.LimitReader(file, identity.Size))
+		if err != nil {
+			return nil, err
+		}
+		if after, err := utils.IdentityOf(file); err != nil || after != identity {
+			return nil, errFileChanged
+		}
+		hashes := &FileHashCache{SHA1Hash: sha1hash, MD5Hash: md5hash}
+		if cacheable {
+			r.hashCache.Add(key, hashes)
+		}
+		return hashes, nil
+	})
+	if err != nil {
+		return nil
+	}
+	return v.(*FileHashCache)
 }
 
 func (r *RuleFailureCreator) setRuntimeAlertK8sDetails(ruleFailure *types.GenericRuleFailure, objectCache objectcache.ObjectCache) {
